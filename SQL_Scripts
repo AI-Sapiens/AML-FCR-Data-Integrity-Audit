@@ -1,0 +1,88 @@
+USE AML_Risk_DB;
+GO
+
+-- Create the curated analytics table
+SELECT 
+    From_Account AS Account_ID,
+    From_Bank AS Source_Bank,
+    To_Bank AS Destination_Bank,
+    Payment_Format,
+    CAST([Timestamp] AS DATE) AS Tx_Date,
+    [Timestamp] AS Tx_Timestamp,
+    Amount_Paid,
+    Payment_Currency,
+    Is_Laundering,
+    
+    -- Feature 1: Structuring Indicator Flag
+    CASE 
+        WHEN Amount_Paid BETWEEN 8500.00 AND 9999.99 THEN 1 
+        ELSE 0 
+    END AS Structuring_Flag,
+    
+    -- Feature 2: Transaction Velocity (Rolling 24h count per account)
+    COUNT(*) OVER(
+        PARTITION BY From_Account, CAST([Timestamp] AS DATE)
+    ) AS Daily_Tx_Velocity,
+    
+    -- Feature 3: Rolling Daily Volume
+    SUM(Amount_Paid) OVER(
+        PARTITION BY From_Account, CAST([Timestamp] AS DATE)
+    ) AS Daily_Total_Volume
+
+INTO Curated_AML_Analytics
+FROM Stage_Transactions;
+GO
+
+-- Add Primary Risk Tiering logic
+ALTER TABLE Curated_AML_Analytics ADD Integrity_Risk_Tier VARCHAR(50);
+GO
+
+UPDATE Curated_AML_Analytics
+SET Integrity_Risk_Tier = CASE 
+    WHEN Structuring_Flag = 1 AND Daily_Tx_Velocity >= 2 THEN 'CRITICAL: Structuring Indicator'
+    WHEN Daily_Tx_Velocity >= 8 THEN 'HIGH: Velocity Anomaly'
+    WHEN Amount_Paid >= 10000 THEN 'MEDIUM: Mandatory CTR Threshold'
+    ELSE 'LOW: Standard Activity'
+END;
+GO
+SELECT COUNT(*) AS Total_Raw_Transactions FROM Stage_Transactions;
+
+-- 1. Create a dedicated database for the FCR project
+CREATE DATABASE AML_Risk_DB;
+GO
+
+USE AML_Risk_DB;
+GO
+
+-- 2. Create the staging table matching HI-Small_Trans.csv
+CREATE TABLE Stage_Transactions (
+    [Timestamp] DATETIME2 NULL,
+    [From_Bank] VARCHAR(50) NULL,
+    [From_Account] VARCHAR(100) NULL,
+    [To_Bank] VARCHAR(50) NULL,
+    [To_Account] VARCHAR(100) NULL,
+    [Amount_Received] DECIMAL(18, 2) NULL,
+    [Receiving_Currency] VARCHAR(20) NULL,
+    [Amount_Paid] DECIMAL(18, 2) NULL,
+    [Payment_Currency] VARCHAR(20) NULL,
+    [Payment_Format] VARCHAR(50) NULL,
+    [Is_Laundering] INT NULL
+);
+GO
+USE AML_Risk_DB;
+GO
+
+-- Create a high-signal extract for Power BI
+SELECT TOP 100000 *
+INTO PowerBI_AML_Reporting
+FROM Curated_AML_Analytics
+WHERE Integrity_Risk_Tier IN ('CRITICAL: Structuring Indicator', 'HIGH: Velocity Anomaly', 'MEDIUM: Mandatory CTR Threshold')
+   OR Is_Laundering = 1
+
+UNION ALL
+
+SELECT TOP 50000 *
+FROM Curated_AML_Analytics
+WHERE Integrity_Risk_Tier = 'LOW: Standard Activity'
+  AND Is_Laundering = 0;
+GO
